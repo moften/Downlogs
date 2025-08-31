@@ -1,0 +1,24 @@
+# Puerto opcional (por defecto 22)
+port: 22
+
+# (Opcional) Fingerprint esperado del host (formato OpenSSH SHA256:xxxxx)
+# Úsalo para asegurarte que te conectas al servidor correcto.
+# host_fingerprint: "SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Ruta a tu clave privada
+key_path: "~/.ssh/id_work"
+
+# Dónde crear el .tgz en el servidor antes de descargar
+remote_tar_path: "/tmp/logs_bundle.tgz"
+
+# Rutas de logs (puedes poner las tuyas personales)
+logs:
+#  - /var/log/nginx/access.log
+#  - /var/log/nginx/error.log
+#  - /var/log/nginx/access.log.1
+#  - /var/log/nginx/error.log.1
+#  - /var/log/syslog          # Debian/Ubuntu
+#  - /var/log/messages        # RHEL/CentOS
+#  - /opt/app/logs/app.log
+#  - /var/www/myapp/var/log/prod.log
+  - /var/log/nginx
