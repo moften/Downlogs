@@ -37,7 +37,11 @@ BANNER = rf"""
  / __ |/  _ \ \/ \/ /    \|  |  /  _ \ / ___\/  ___/
 / /_/ (  <_> )     /   |  \  |_(  <_> ) /_/  >___ \ 
 \____ |\____/ \/\_/|___|  /____/\____/\___  /____  >
-     \/                 \/           /_____/     \/        
+     \/                 \/           /_____/     \/       
+
+
+        by m10sec (2025) - Flipador de Tools - m10sec@proton.me
+        Descarga rápidamente tus logs para análisis
 
 {Style.RESET_ALL}"""
 
