@@ -10,7 +10,11 @@ import socket
 import shlex
 import base64
 import hashlib
+import warnings
 from pathlib import Path
+
+# Silenciar deprecations molestos de cryptography (TripleDES)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     import yaml
@@ -59,6 +63,12 @@ def print_banner():
 def human_bool(b: bool) -> str:
     return "yes" if b else "no"
 
+def _human_size(num):
+    for unit in ["B","KB","MB","GB","TB"]:
+        if num < 1024.0 or unit == "TB":
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
+
 # ---------------------- config / IO ----------------------
 
 def load_config(path: Path) -> dict:
@@ -82,7 +92,7 @@ def merge_cli_over_config(cfg: dict, args) -> dict:
         cfg["remote_tar_path"] = str(Path(remote_dir) / args.tar_name)
     return cfg
 
-# ---------------------- SSH helpers ----------------------
+# ---------------------- SSH helpers  ----------------------
 
 def ssh_connect(host: str, user: str, cfg: dict, verbose=False):
     key_path = os.path.expanduser(cfg.get("key_path", ""))
@@ -125,6 +135,10 @@ def ssh_connect(host: str, user: str, cfg: dict, verbose=False):
             allow_agent=True,
             look_for_keys=True,
         )
+        # Mantener viva la sesión (evita timeouts en descargas largas, reciém agregado para evitar timeout)
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)  
     except paramiko.AuthenticationException:
         print(c_warn("Autenticación por clave falló. Intentando con contraseña..."))
         password = getpass.getpass("Contraseña SSH: ")
@@ -137,6 +151,9 @@ def ssh_connect(host: str, user: str, cfg: dict, verbose=False):
             allow_agent=False,
             look_for_keys=False,
         )
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)
     except (socket.timeout, socket.error) as e:
         print(c_err(f"No se pudo conectar a {host}:{port} -> {e}"))
         raise
@@ -182,65 +199,145 @@ def sftp_write_text(ssh: paramiko.SSHClient, remote_path: str, content: str):
     finally:
         sftp.close()
 
-def _human_size(num):
-    # Helper por si no hay tqdm: transformar bytes a KB/MB/GB
-    for unit in ["B","KB","MB","GB","TB"]:
-        if num < 1024.0 or unit == "TB":
-            return f"{num:.1f} {unit}"
-        num /= 1024.0
+# ---------------------- Descarga reanudable ----------------------
 
-def sftp_download(ssh: paramiko.SSHClient, remote_path: str, local_path: Path, verbose=False):
+def sftp_download(ssh: paramiko.SSHClient, remote_path: str, local_path: Path, verbose=False, retries: int = 6, chunk_size: int = 32768):
     """
-    Descarga con barra de progreso. Usa tqdm si está instalada; si no, fallback simple.
+    Descarga reanudable con SFTP.
+    - Si el archivo local existe, continúa desde el offset.
+    - Reintenta cuando el servidor corta la conexión (EOF/SSHException).
+    - Muestra barra de progreso si tqdm está disponible.
     """
-    sftp = ssh.open_sftp()
-    try:
-        # Obtener tamaño remoto si es posible
+    attempt = 0
+    last_err = None
+
+    while attempt <= retries:
         try:
+            sftp = ssh.open_sftp()
+            # Tamaño remoto (si no existe, excepción)
             rstat = sftp.stat(remote_path)
-            total = getattr(rstat, "st_size", None)
-        except Exception:
-            total = None
+            remote_size = getattr(rstat, "st_size", None)
 
-        if verbose:
-            print(c_info(f"Descargando vía SFTP: {remote_path} -> {local_path}"))
+            if verbose:
+                print(c_info(f"Descargando vía SFTP: {remote_path} -> {local_path} (size: {remote_size} bytes)"))
 
-        if _HAS_TQDM and total is not None and total > 0:
-            with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc="Descarga", leave=True) as bar:
-                def _cb(transferred, _total):
-                    # tqdm maneja incrementos; ajustamos a delta
-                    bar.update(transferred - bar.n)
-                sftp.get(remote_path, str(local_path), callback=_cb)
-        else:
-            # Fallback sin tqdm: porcentaje en la misma línea
-            transferred_last = 0
-            start = time.time()
 
-            def _print_progress(transferred):
-                nonlocal transferred_last
-                if total:
-                    pct = (transferred / total) * 100
-                    speed = (transferred / max(time.time() - start, 1e-6))
-                    sys.stdout.write(
-                        f"\rDescarga: {pct:6.2f}%  "
-                        f"{_human_size(transferred)} / { _human_size(total) if total else '¿?' }  "
-                        f"({_human_size(speed)}/s)"
+            # Offset local si existe archivo parcial
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            offset = 0
+            if local_path.exists():
+                offset = local_path.stat().st_size
+                if offset > (remote_size or 0):
+                    # más grande que remoto: borramos y empezamos
+                    if verbose:
+                        print(c_warn("El archivo local es mayor que el remoto; reiniciando descarga."))
+                    local_path.unlink()
+                    offset = 0
+
+            rf = sftp.open(remote_path, "rb")
+            lf = open(local_path, "ab")
+
+            try:
+                if offset:
+                    rf.seek(offset)
+
+                # Preparar progreso, añadido para ver como vamos
+                if _HAS_TQDM and remote_size:
+                    bar = tqdm(
+                        total=remote_size,
+                        initial=offset,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc="Descarga",
+                        leave=True
                     )
+                    def _update_bar(n):
+                        bar.update(n)
                 else:
-                    # sin total, mostramos lo transferido
-                    sys.stdout.write(f"\rDescarga: {_human_size(transferred)}")
-                sys.stdout.flush()
-                transferred_last = transferred
+                    bar = None
+                    start = time.time()
+                    last_shown = offset
+                    def _print_progress(transferred_now):
+                        nonlocal last_shown
+                        last_shown += transferred_now
+                        if remote_size:
+                            pct = (last_shown / remote_size) * 100
+                            speed = (last_shown - offset) / max(time.time() - start, 1e-6)
+                            sys.stdout.write(
+                                f"\rDescarga: {pct:6.2f}%  "
+                                f"{_human_size(last_shown)} / {_human_size(remote_size)}  "
+                                f"({_human_size(speed)}/s)"
+                            )
+                            sys.stdout.flush()
+                        else:
+                            sys.stdout.write(f"\rDescarga: {_human_size(last_shown)}")
+                            sys.stdout.flush()
 
-            def _cb(transferred, _total):
-                _print_progress(transferred)
+                # Loop de lectura
+                while True:
+                    data = rf.read(chunk_size)
+                    if not data:
+                        break
+                    lf.write(data)
+                    if _HAS_TQDM and remote_size:
+                        _update_bar(len(data))
+                    else:
+                        _print_progress(len(data))
 
-            sftp.get(remote_path, str(local_path), callback=_cb)
-            sys.stdout.write("\n")
-    finally:
-        sftp.close()
+                if bar:
+                    bar.close()
+                else:
+                    sys.stdout.write("\n")
 
-# ---------------------- core ----------------------
+                lf.flush()
+
+                # Validar tamaño final
+                if (remote_size is None) or (local_path.stat().st_size == remote_size):
+                    
+                    try:
+                        lf.close()
+                    except Exception:
+                        pass
+                    try:
+                        rf.close()
+                    except Exception:
+                        pass
+                    sftp.close()
+                    return
+                else:
+                    raise IOError("Tamaño local no coincide con el remoto; se reintentará.")
+
+            finally:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+                try:
+                    rf.close()
+                except Exception:
+                    pass
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
+        except (EOFError, paramiko.SSHException, socket.error) as e:
+            # Conexión cortada; reintentar
+            last_err = e
+            attempt += 1
+            if verbose:
+                print()
+                print(c_warn(f"Conexión SFTP cortada (intento {attempt}/{retries}). Reanudando en breve... Detalle: {e}"))
+            time.sleep(min(5 * attempt, 30))
+            continue
+        except Exception as e:
+            last_err = e
+            break
+
+    # Si llegamos aquí, falló definitivamente
+    raise RuntimeError(f"Falló la descarga reanudable de {remote_path}: {last_err}")
+
 
 def build_remote_tar(ssh: paramiko.SSHClient, log_paths: list, remote_tar_path: str, verbose=False, dry_run=False) -> None:
     # Filtrar rutas existentes
@@ -275,17 +372,15 @@ def build_remote_tar(ssh: paramiko.SSHClient, log_paths: list, remote_tar_path: 
     list_content = "\n".join(existing) + "\n"
     sftp_write_text(ssh, tmp_list, list_content)
 
-    # Empaquetar
-    tar_cmd = f"tar -czf {shlex.quote(remote_tar_path)} -T {shlex.quote(tmp_list)} --ignore-failed-read"
+    # Empaquetar (gzip nivel 1 para menos CPU en servidores cargados)
+    tar_cmd = f"tar -czf {shlex.quote(remote_tar_path)} -T {shlex.quote(tmp_list)} --ignore-failed-read --gzip --force-local"
     rc, _, err = run_cmd(ssh, tar_cmd, verbose=verbose)
 
-    # Limpiar la lista temporal
+    # Limpiar la lista temporal del server 
     run_cmd(ssh, f"rm -f {shlex.quote(tmp_list)}", verbose=verbose)
 
     if rc != 0:
         raise RuntimeError(f"Fallo al crear tar.gz remoto: {err}")
-
-# ---------------------- main ----------------------
 
 def build_argparser() -> argparse.ArgumentParser:
     program_dir = Path(sys.argv[0]).resolve().parent
