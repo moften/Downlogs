@@ -17,8 +17,9 @@ logs:
 #  - /var/log/nginx/error.log
 #  - /var/log/nginx/access.log.1
 #  - /var/log/nginx/error.log.1
-#  - /var/log/syslog          # Debian/Ubuntu
+  - /var/log/syslog          # Debian/Ubuntu
 #  - /var/log/messages        # RHEL/CentOS
 #  - /opt/app/logs/app.log
 #  - /var/www/myapp/var/log/prod.log
   - /var/log/nginx
+  - /var/www/sites/simplesamlphp/log

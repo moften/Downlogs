@@ -1,0 +1,13 @@
+# Requerimientos de desarrollo para Remote Logs Retriever
+
+# Testing
+pytest==8.3.2       # framework de testing
+pytest-cov==5.0.0   # coverage para pytest
+
+# Calidad de código
+flake8==7.1.1       # linting
+black==24.8.0       # formateador de código
+isort==5.13.2       # orden de imports
+
+# Seguridad
+bandit==1.7.9       # análisis estático de seguridad en Python

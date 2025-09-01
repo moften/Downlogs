@@ -13,12 +13,19 @@ import hashlib
 from pathlib import Path
 
 try:
-    import yaml  
-    import paramiko  
+    import yaml
+    import paramiko
     from colorama import init as colorama_init, Fore, Style
 except Exception as e:
     print("[X] Falta un paquete: instala con 'pip install paramiko pyyaml colorama'", file=sys.stderr)
     sys.exit(1)
+
+# --- opcional: tqdm para una barra más pro ---
+try:
+    from tqdm import tqdm  # pip install tqdm
+    _HAS_TQDM = True
+except Exception:
+    _HAS_TQDM = False
 
 # ---------------------- UI / helpers ----------------------
 
@@ -175,12 +182,61 @@ def sftp_write_text(ssh: paramiko.SSHClient, remote_path: str, content: str):
     finally:
         sftp.close()
 
+def _human_size(num):
+    # Helper por si no hay tqdm: transformar bytes a KB/MB/GB
+    for unit in ["B","KB","MB","GB","TB"]:
+        if num < 1024.0 or unit == "TB":
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
+
 def sftp_download(ssh: paramiko.SSHClient, remote_path: str, local_path: Path, verbose=False):
-    if verbose:
-        print(c_info(f"Descargando vía SFTP: {remote_path} -> {local_path}"))
+    """
+    Descarga con barra de progreso. Usa tqdm si está instalada; si no, fallback simple.
+    """
     sftp = ssh.open_sftp()
     try:
-        sftp.get(remote_path, str(local_path))
+        # Obtener tamaño remoto si es posible
+        try:
+            rstat = sftp.stat(remote_path)
+            total = getattr(rstat, "st_size", None)
+        except Exception:
+            total = None
+
+        if verbose:
+            print(c_info(f"Descargando vía SFTP: {remote_path} -> {local_path}"))
+
+        if _HAS_TQDM and total is not None and total > 0:
+            with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, desc="Descarga", leave=True) as bar:
+                def _cb(transferred, _total):
+                    # tqdm maneja incrementos; ajustamos a delta
+                    bar.update(transferred - bar.n)
+                sftp.get(remote_path, str(local_path), callback=_cb)
+        else:
+            # Fallback sin tqdm: porcentaje en la misma línea
+            transferred_last = 0
+            start = time.time()
+
+            def _print_progress(transferred):
+                nonlocal transferred_last
+                if total:
+                    pct = (transferred / total) * 100
+                    speed = (transferred / max(time.time() - start, 1e-6))
+                    sys.stdout.write(
+                        f"\rDescarga: {pct:6.2f}%  "
+                        f"{_human_size(transferred)} / { _human_size(total) if total else '¿?' }  "
+                        f"({_human_size(speed)}/s)"
+                    )
+                else:
+                    # sin total, mostramos lo transferido
+                    sys.stdout.write(f"\rDescarga: {_human_size(transferred)}")
+                sys.stdout.flush()
+                transferred_last = transferred
+
+            def _cb(transferred, _total):
+                _print_progress(transferred)
+
+            sftp.get(remote_path, str(local_path), callback=_cb)
+            sys.stdout.write("\n")
     finally:
         sftp.close()
 
